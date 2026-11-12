@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pygame
 
@@ -57,8 +57,13 @@ BOSS_MAX_HP = 1000
 BOSS_X = 900
 BOSS_FEET_Y = 628
 BATTLE_DURATION = 11.0
-BURGER_CHANCE = 0.035   # шанс, что босс перекусит бургером
-LASER_CHANCE = 0.035    # шанс лазера из пупка
+BURGER_CHANCE = 0.06    # шанс, что босс перекусит бургером
+LASER_CHANCE = 0.10     # шанс лазера из пупка
+POUND_CHANCE = 0.19     # топот: ударные волны по земле
+SPIT_CHANCE = 0.18      # плевок в бойцов
+SPIN_CHANCE = 0.13      # вертушка руками
+STRIKE_CHANCE = 0.34    # обычный удар лапой
+BOSS_HEAL_SHARE = 0.08  # сколько здоровья восстанавливает бургер
 BATTLE_RANGED_SHARE = 0.62
 BATTLE_SCALE = 0.55
 
@@ -117,6 +122,28 @@ NEGATIVE_MUTATIONS = (
     Mutation("Из китай города", "agility", -0.14, False),
     Mutation("ИГОРЬ К.", "power", -0.18, False),
     Mutation("РАБ РЫГАЧЁВА", "power", -0.22, False),
+)
+
+
+# болезни: временно ухудшают характеристики, но проходят
+@dataclass(frozen=True)
+class Disease:
+    name: str
+    multipliers: dict
+    duration: float
+    weight: float
+    color: tuple
+
+
+DISEASES = (
+    Disease("Простуда", {"power": 0.90, "agility": 0.82, "mind": 0.95},
+            35.0, 0.34, (144, 206, 150)),
+    Disease("Лихорадка", {"power": 0.75, "agility": 0.80, "mind": 0.70},
+            26.0, 0.28, (226, 176, 92)),
+    Disease("Дизентерия", {"power": 0.66, "agility": 0.72, "mind": 0.90},
+            30.0, 0.24, (196, 132, 76)),
+    Disease("Чума", {"power": 0.55, "agility": 0.55, "mind": 0.60},
+            20.0, 0.14, (188, 92, 120)),
 )
 
 
@@ -223,10 +250,33 @@ class Genome:
 
     stats: dict
     generation: int
+    disease: str = ""
+    disease_left: float = 0.0
+    disease_mult: dict = field(default_factory=dict)
+
+    def is_sick(self) -> bool:
+        return self.disease_left > 0 and self.disease
+
+    def effective_stats(self) -> dict:
+        """Характеристики с учётом текущей болезни."""
+        if not self.is_sick():
+            return dict(self.stats)
+        return {
+            key: max(0.05, min(1.0, self.stats[key] * self.disease_mult.get(key, 1.0)))
+            for key in STAT_KEYS
+        }
+
+    def tick(self, dt: float):
+        if self.disease_left > 0:
+            self.disease_left -= dt
+            if self.disease_left <= 0:
+                self.disease_left = 0.0
+                self.disease = ""
+                self.disease_mult = {}
 
     def fitness(self) -> float:
         """Приспособленность — чем выше, тем больше шансов оставить потомство."""
-        s = self.stats
+        s = self.effective_stats()
         return 0.40 * s["power"] + 0.35 * s["agility"] + 0.25 * s["mind"]
 
 
@@ -538,15 +588,22 @@ class Spartan:
 class Soldier:
     """Солдат армии: стоит в строю, потом уходит на войну."""
 
-    def __init__(self, slot: int, look: Look, stats=None):
+    def __init__(self, slot: int, look: Look, stats=None, genome=None):
         self.slot = slot
         self.look = look
-        self.stats = dict(stats) if stats else {"power": 0.5, "agility": 0.5, "mind": 0.5}
+        self.genome = genome
+        self.stats = genome.effective_stats() if genome is not None else (
+            dict(stats) if stats else {"power": 0.5, "agility": 0.5, "mind": 0.5})
         col = slot % ARMY_COLS
         row = (slot // ARMY_COLS) % ARMY_ROWS
         self.x = float(ARMY_X0 + col * ARMY_DX)
         self.y = float(ARMY_Y0 + row * ARMY_DY)
         self.phase = random.random() * math.tau
+
+    def current_stats(self):
+        if self.genome is not None:
+            return self.genome.effective_stats()
+        return self.stats
 
 
 def win_chance(soldiers) -> float:
@@ -555,12 +612,12 @@ def win_chance(soldiers) -> float:
         return 0.0
     total = 0.0
     for soldier in soldiers:
-        stats = soldier.stats
+        stats = soldier.current_stats()
         total += (0.40 * stats.get("power", 0.5)
                   + 0.35 * stats.get("agility", 0.5)
                   + 0.25 * stats.get("mind", 0.5))
     average = total / len(soldiers)
-    return max(0.05, min(0.95, (average - 0.30) * 1.8))
+    return max(0.03, min(0.80, (average - 0.42) * 1.7))
 
 
 class BattleSoldier:
@@ -568,7 +625,8 @@ class BattleSoldier:
 
     def __init__(self, soldier, role: str, x: float, y: float):
         self.look = soldier.look
-        self.stats = soldier.stats
+        self.stats = soldier.current_stats()
+        self.genome = getattr(soldier, "genome", None)
         self.role = role
         self.x = x
         self.y = y
@@ -624,6 +682,8 @@ class BattleSoldier:
                                  (self.x + 31 + thrust, self.y - 41)])
         screen.blit(sprite, (int(self.x - sprite.get_width() / 2 + (6 * self.lunge if self.role == "melee" else 0)),
                              int(self.y - sprite.get_height() + bob)))
+        if self.genome is not None and self.genome.is_sick():
+            draw_sick_mark(screen, int(self.x), int(self.y - sprite.get_height() + bob - 7), 0.8)
 
 
 class Spear:
@@ -654,6 +714,55 @@ class Spear:
         pygame.draw.circle(screen, (226, 230, 236), (int(self.x + dx), int(self.y + dy)), 3)
 
 
+class Spit:
+    """Плевок босса: летит по дуге в бойца."""
+
+    def __init__(self, x, y, tx, ty):
+        self.x0, self.y0 = x, y
+        self.tx, self.ty = tx, ty
+        self.t = 0.0
+        self.dur = max(0.35, math.hypot(tx - x, ty - y) / 780.0)
+        self.x, self.y = x, y
+
+    def update(self, dt):
+        self.t += dt
+        k = min(1.0, self.t / self.dur)
+        self.x = self.x0 + (self.tx - self.x0) * k
+        self.y = self.y0 + (self.ty - self.y0) * k - math.sin(k * math.pi) * 70
+        return self.t < self.dur
+
+    def draw(self, screen):
+        pygame.draw.circle(screen, (154, 214, 110), (int(self.x), int(self.y)), 7)
+        pygame.draw.circle(screen, (196, 236, 150), (int(self.x - 2), int(self.y - 2)), 3)
+        pygame.draw.circle(screen, (110, 168, 78), (int(self.x + 6), int(self.y + 5)), 2)
+
+
+class Shockwave:
+    """Ударная волна от топота: расходится по земле."""
+
+    def __init__(self, x, y, delay=0.0):
+        self.x, self.y = x, y
+        self.t = -delay
+        self.dur = 0.75
+
+    def update(self, dt):
+        self.t += dt
+        return self.t < self.dur
+
+    def draw(self, screen):
+        if self.t < 0:
+            return
+        k = min(1.0, self.t / self.dur)
+        alpha = int(150 * (1.0 - k))
+        radius = int(70 + 620 * k)
+        height = int(radius * 0.62)
+        layer = pygame.Surface((radius * 2, height * 2), pygame.SRCALPHA)
+        rect = pygame.Rect(0, 0, radius * 2, height * 2)
+        pygame.draw.ellipse(layer, (238, 196, 120, alpha), rect, 5)
+        pygame.draw.ellipse(layer, (200, 150, 86, alpha // 2), rect.inflate(-18, -10), 3)
+        screen.blit(layer, (int(self.x - radius), int(self.y - height)))
+
+
 class Boss:
     """ОГРОМНЫЙ жирный парень в зелёной футболке."""
 
@@ -671,6 +780,10 @@ class Boss:
         self.eat_progress = 0.0
         self.laser_glow = 0.0
         self.laser_to = None
+        self.spit_to = None
+        self.spit_progress = 0.0
+        self.spin_angle = 0.0
+        self.pound_phase = 0.0
         self.attack = 0.0
         self.arm_swing = 0.0
 
@@ -689,6 +802,27 @@ class Boss:
         self.timer = 0.95
         self.laser_to = target
         self.laser_glow = 1.0
+
+    def start_pound(self):
+        """Топот: босс поднимает руки и бьёт по земле."""
+        self.state = "pound"
+        self.timer = 0.95
+        self.pound_phase = 0.0
+        self.arm_swing = 1.0
+
+    def start_spit(self, target):
+        """Плевок в бойцов."""
+        self.state = "spit"
+        self.timer = 0.85
+        self.spit_to = target
+        self.spit_progress = 0.0
+
+    def start_spin(self):
+        """Вертушка: босс раскручивается и разбрасывает бойцов."""
+        self.state = "spin"
+        self.timer = 1.1
+        self.spin_angle = 0.0
+        self.arm_swing = 1.0
 
     def start_death(self):
         self.state = "dying"
@@ -712,8 +846,16 @@ class Boss:
                 self.burger = 0.0
                 self.eat_progress = 0.0
                 self.laser_to = None
+                self.spit_to = None
+                self.spin_angle = 0.0
         if self.state == "eat":
             self.eat_progress = min(1.0, 1.0 - self.timer / 1.15)
+        elif self.state == "pound":
+            self.pound_phase = min(1.0, 1.0 - self.timer / 0.95)
+        elif self.state == "spit":
+            self.spit_progress = min(1.0, 1.0 - self.timer / 0.85)
+        elif self.state == "spin":
+            self.spin_angle += dt * 15.0
 
     # ----- отрисовка -----
     def _surface(self):
@@ -772,6 +914,21 @@ class Boss:
         elif self.state == "attack":
             hand_l = (146, 368)
             hand_r = (356 - int(120 * swing), 330 + int(40 * swing))
+        elif self.state == "pound":
+            if self.pound_phase < 0.5:
+                lift = self.pound_phase * 2.0
+                hand_l = (148, int(340 - 190 * lift))
+                hand_r = (322, int(340 - 190 * lift))
+            else:
+                drop = (self.pound_phase - 0.5) * 2.0
+                hand_l = (148, int(150 + 230 * drop))
+                hand_r = (322, int(150 + 230 * drop))
+        elif self.state == "spin":
+            hand_l = (60, 300 + int(math.sin(self.spin_angle) * 18))
+            hand_r = (410, 300 - int(math.sin(self.spin_angle) * 18))
+        elif self.state == "spit":
+            hand_l = (140, 366)
+            hand_r = (304, 208 - int(16 * self.spit_progress))
         else:
             hand_l = (140, 366)
             hand_r = (330, 366)
@@ -803,7 +960,13 @@ class Boss:
         pygame.draw.circle(surf, (34, 28, 30), (256, 148), 4)
         pygame.draw.arc(surf, (70, 48, 40), (200, 128, 28, 18), 3.4, 6.0, 3)
         pygame.draw.arc(surf, (70, 48, 40), (242, 128, 28, 18), 3.4, 6.0, 3)
-        pygame.draw.arc(surf, (120, 64, 56), (210, 164, 50, 26), 3.4, 5.9, 3)
+        if self.state == "spit":
+            pygame.draw.ellipse(surf, (86, 40, 42), (214, 160, 44, 30))
+            pygame.draw.ellipse(surf, (196, 88, 82), (224, 172, 24, 14))
+            drool = 4 + int(8 * self.spit_progress)
+            pygame.draw.line(surf, (154, 206, 120), (240, 184), (240, 184 + drool), 3)
+        else:
+            pygame.draw.arc(surf, (120, 64, 56), (210, 164, 50, 26), 3.4, 5.9, 3)
         pygame.draw.arc(surf, (196, 146, 116), (196, 186, 78, 30), 3.3, 6.0, 2)
         pygame.draw.circle(surf, (214, 156, 126), (235, 160), 3)
 
@@ -835,6 +998,27 @@ class Boss:
             image = pygame.transform.rotozoom(surf, -angle, 1.0)
             screen.blit(image, (int(self.x - image.get_width() / 2),
                                 int(self.feet - image.get_height() + bob + angle * 0.8)))
+        elif self.state == "spin":
+            sway = math.sin(self.spin_angle) * 9.0
+            image = pygame.transform.rotozoom(surf, sway, 1.0)
+            # следы вертушки
+            trail = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+            for k in range(3):
+                radius = 150 + k * 34
+                rect = pygame.Rect(0, 0, radius * 2, int(radius * 0.7))
+                rect.center = (int(self.x), int(self.feet - 170))
+                pygame.draw.arc(trail, (255, 220, 160, 70 - k * 18), rect,
+                                self.spin_angle + k, self.spin_angle + k + 2.1, 4)
+            screen.blit(trail, (0, 0))
+            screen.blit(image, (int(self.x - image.get_width() / 2 + sway * 0.6),
+                                int(self.feet - image.get_height() + bob)))
+        elif self.state == "pound" and self.pound_phase > 0.55:
+            # приседание от удара по земле
+            squash = 0.92
+            image = pygame.transform.smoothscale(
+                surf, (int(surf.get_width() * 1.05), int(surf.get_height() * squash)))
+            screen.blit(image, (int(self.x - image.get_width() / 2),
+                                int(self.feet - image.get_height() + 6)))
         else:
             shake = math.sin(self.t * 40) * 3 if self.hit > 0.2 else 0
             screen.blit(surf, (int(self.x - 235 + shake), int(top)))
@@ -850,14 +1034,17 @@ class Battle:
         self.boss = Boss()
         self.soldiers = []
         self.spears = []
+        self.spits = []
+        self.waves = []
         self.particles = []
         self.texts = []
         self.kill_acc = 0.0
+        self.shake = 0.0
+        self._shake_surface = None
         self.result = None
         self.result_timer = 0.0
         self.finished = False
-        self.attack_timer = 1.1
-        self.special_timer = 1.2
+        self.attack_timer = 0.75
         self.boss_hp_shown = 1.0
         self.navel_text_timer = 6.0
         self.arena = self._build_arena()
@@ -869,8 +1056,8 @@ class Battle:
         for y in range(HEIGHT):
             t = min(1.0, y / (HEIGHT - 1) * 1.35)
             surf.fill(lerp_color((16, 18, 30), (52, 34, 30), t), (0, y, WIDTH, 1))
-        pygame.draw.circle(surf, (226, 214, 184), (212, 108), 46)
-        pygame.draw.circle(surf, (242, 232, 204), (212, 108), 34)
+        pygame.draw.circle(surf, (226, 214, 184), (742, 104), 46)
+        pygame.draw.circle(surf, (242, 232, 204), (742, 104), 34)
         # далёкие горы
         pygame.draw.polygon(surf, (26, 26, 42), [(0, 470), (190, 300), (390, 470)])
         pygame.draw.polygon(surf, (22, 22, 36), [(260, 480), (520, 270), (790, 480)])
@@ -937,27 +1124,96 @@ class Battle:
         victim.kill()
         self._burst(victim.x, victim.y - 26, (150, 54, 48), 8)
 
-    def _special(self):
+    def kill_near(self, x, y):
+        alive = [s for s in self.soldiers if s.alive]
+        if not alive:
+            return
+        victim = min(alive, key=lambda s: (s.x - x) ** 2 + (s.y - y) ** 2)
+        victim.kill()
+        self._burst(victim.x, victim.y - 26, (150, 54, 48), 8)
+
+    def _attack(self):
+        """Босс выбирает атаку по весам — чем дальше бой, тем чаще бьёт."""
         roll = random.random()
-        if roll < BURGER_CHANCE:
-            self.boss.start_eat()
-            self.boss.hp = min(self.boss.max_hp, self.boss.hp + self.boss.max_hp * 0.10)
-            self.texts.append(FloatingText("БУРГЕР! +10%", self.boss.x, self.boss.feet - 420,
-                                           (140, 226, 140), life=1.6, font_key="title"))
-            self._burst(self.boss.x, self.boss.feet - 330, (130, 220, 130), 16)
-        elif roll < BURGER_CHANCE + LASER_CHANCE:
-            target = random.choice([s for s in self.soldiers if s.alive] or self.soldiers)
+        if roll < STRIKE_CHANCE:
+            # обычный удар лапой
+            self.boss.play_attack()
+            for _ in range(random.randint(1, 2)):
+                self.kill_one()
+            self.shake = max(self.shake, 5.0)
+            self._burst(self.boss.x - 170, self.boss.feet - 120, (120, 90, 60), 6)
+        elif roll < STRIKE_CHANCE + POUND_CHANCE:
+            # топот: две ударные волны по земле
+            self.boss.start_pound()
+            self.waves.append(Shockwave(self.boss.x, self.boss.feet - 8, 0.22))
+            self.waves.append(Shockwave(self.boss.x, self.boss.feet - 8, 0.52))
+            for _ in range(random.randint(3, 4)):
+                self.kill_one()
+            self.shake = max(self.shake, 15.0)
+            for _ in range(26):
+                self.particles.append(Particle(
+                    self.boss.x - 300 + random.uniform(-200, 200), self.boss.feet - 10,
+                    random.uniform(-160, 160), random.uniform(-220, -40),
+                    random.uniform(0.4, 0.9), (176, 142, 96), random.uniform(1.6, 3.4)))
+            self.texts.append(FloatingText("ТОПОТ!", self.boss.x, self.boss.feet - 430,
+                                           (240, 196, 128), life=1.2, font_key="bold"))
+        elif roll < STRIKE_CHANCE + POUND_CHANCE + SPIT_CHANCE:
+            # плевок в трёх бойцов
+            alive = [s for s in self.soldiers if s.alive]
+            if not alive:
+                return
+            targets = random.sample(alive, min(3, len(alive)))
+            target = random.choice(targets)
+            self.boss.start_spit((target.x, target.y - 20))
+            for soldier in targets:
+                self.spits.append(Spit(self.boss.x - 26, self.boss.feet - 318,
+                                       soldier.x, soldier.y - 26))
+            self.shake = max(self.shake, 4.0)
+            self.texts.append(FloatingText("ПЛЕВОК!", self.boss.x, self.boss.feet - 430,
+                                           (176, 226, 130), life=1.2, font_key="bold"))
+        elif roll < STRIKE_CHANCE + POUND_CHANCE + SPIT_CHANCE + SPIN_CHANCE:
+            # вертушка: разбрасывает ближний бой
+            self.boss.start_spin()
+            for _ in range(random.randint(3, 5)):
+                self.kill_one()
+            self.shake = max(self.shake, 11.0)
+            for _ in range(20):
+                angle = random.uniform(0, math.tau)
+                speed = random.uniform(140, 320)
+                self.particles.append(Particle(
+                    self.boss.x + math.cos(angle) * 120, self.boss.feet - 170 + math.sin(angle) * 80,
+                    math.cos(angle) * speed, math.sin(angle) * speed - 40,
+                    random.uniform(0.3, 0.7), (240, 208, 150), random.uniform(1.5, 3.0)))
+            self.texts.append(FloatingText("ВЕРТУШКА!", self.boss.x, self.boss.feet - 430,
+                                           (255, 210, 150), life=1.2, font_key="bold"))
+        elif roll < STRIKE_CHANCE + POUND_CHANCE + SPIT_CHANCE + SPIN_CHANCE + LASER_CHANCE:
+            # лазер из пупка
+            alive = [s for s in self.soldiers if s.alive]
+            if not alive:
+                return
+            target = random.choice(alive)
             self.boss.start_laser((target.x, target.y - 20))
             for _ in range(3):
                 self.kill_one()
-            self.texts.append(FloatingText("ЛАЗЕР ИЗ ПУПКА!", self.boss.x, self.boss.feet - 420,
+            self.shake = max(self.shake, 8.0)
+            self.texts.append(FloatingText("ЛАЗЕР ИЗ ПУПКА!", self.boss.x, self.boss.feet - 430,
                                            (255, 140, 90), life=1.6, font_key="title"))
             self._burst(self.boss.x, self.boss.feet - 98, (255, 160, 90), 18)
+        else:
+            # бургер: лечится
+            self.boss.start_eat()
+            self.boss.hp = min(self.boss.max_hp, self.boss.hp + self.boss.max_hp * BOSS_HEAL_SHARE)
+            self.texts.append(FloatingText(f"БУРГЕР! +{int(BOSS_HEAL_SHARE * 100)}%",
+                                           self.boss.x, self.boss.feet - 430,
+                                           (140, 226, 140), life=1.6, font_key="title"))
+            self._burst(self.boss.x, self.boss.feet - 330, (130, 220, 130), 16)
 
     def update(self, dt):
         self.time += dt
         self.boss.update(dt)
         self.boss.hp = max(0, min(self.boss.max_hp, self.boss.hp))
+        if self.shake > 0:
+            self.shake = max(0.0, self.shake - dt * 22.0)
         for soldier in self.soldiers:
             soldier.update(dt, self)
 
@@ -966,6 +1222,16 @@ class Battle:
                 self.spears.remove(spear)
                 self.boss.hit = max(self.boss.hit, 0.22)
                 self._burst(spear.tx, spear.ty, (255, 220, 150), 5)
+
+        for spit in list(self.spits):
+            if not spit.update(dt):
+                self.spits.remove(spit)
+                self._burst(spit.tx, spit.ty, (154, 214, 110), 9)
+                self.kill_near(spit.tx, spit.ty)
+
+        for wave in list(self.waves):
+            if not wave.update(dt):
+                self.waves.remove(wave)
 
         for particle in self.particles:
             particle.update(dt)
@@ -993,22 +1259,16 @@ class Battle:
         # босс теряет здоровье; при поражении армии застревает на ~20%
         damage_share = 1.0 if self.victory else 0.8
         target_hp = self.boss.max_hp * (1.0 - damage_share * progress)
-        if self.boss.hp > target_hp:
+        if self.boss.state != "eat" and self.boss.hp > target_hp:
             self.boss.hp = max(target_hp, self.boss.hp - self.boss.max_hp * 0.9 * dt)
         elif self.boss.hp < target_hp - self.boss.max_hp * 0.02:
             self.boss.hp = min(target_hp, self.boss.hp + self.boss.max_hp * 0.25 * dt)
 
         self.attack_timer -= dt
         if self.attack_timer <= 0:
-            self.attack_timer = random.uniform(1.0, 1.8)
-            self.boss.play_attack()
-            self.kill_one()
-            self._burst(self.boss.x - 170, self.boss.feet - 120, (120, 90, 60), 6)
-
-        self.special_timer -= dt
-        if self.special_timer <= 0:
-            self.special_timer = random.uniform(0.9, 1.4)
-            self._special()
+            # к концу боя босс звереет и бьёт чаще
+            self.attack_timer = random.uniform(0.62, 1.12) * (1.0 - 0.18 * progress)
+            self._attack()
 
         self.navel_text_timer -= dt
         if self.navel_text_timer <= 0:
@@ -1016,15 +1276,16 @@ class Battle:
             self.texts.append(FloatingText("ГДЕ МОИ НОГИ?", self.boss.x, self.boss.feet - 430,
                                            (228, 216, 194), life=2.2, font_key="bold"))
 
-        self.kill_acc += (2.2 if self.victory else 9.5) * dt
+        self.kill_acc += (2.8 if self.victory else 11.5) * dt
         while self.kill_acc >= 1:
             self.kill_acc -= 1
             if not any(s.alive for s in self.soldiers):
                 break
             self.kill_one()
 
-        if progress >= 1.0:
-            if self.victory:
+        army_wiped = not any(s.alive for s in self.soldiers)
+        if progress >= 1.0 or (army_wiped and not self.victory):
+            if self.victory and not army_wiped:
                 self.boss.hp = 0
                 self.boss.start_death()
                 self.result = "victory"
@@ -1042,10 +1303,23 @@ class Battle:
 
     # ----- отрисовка -----
     def draw(self, screen, sprites, fonts, sim):
-        screen.blit(self.arena, (0, 0))
+        world = screen
+        ox = oy = 0
+        if self.shake > 0.4:
+            if self._shake_surface is None:
+                self._shake_surface = pygame.Surface((WIDTH, HEIGHT)).convert()
+            world = self._shake_surface
+            ox = random.randint(-int(self.shake), int(self.shake))
+            oy = random.randint(-int(self.shake * 0.6), int(self.shake * 0.6))
+
+        world.blit(self.arena, (0, 0))
+
+        # ударные волны от топота
+        for wave in self.waves:
+            wave.draw(world)
 
         # босс
-        self.boss.draw(screen)
+        self.boss.draw(world)
 
         # лазер из пупка
         if self.boss.state == "laser" and self.boss.laser_to is not None:
@@ -1056,16 +1330,18 @@ class Battle:
             pygame.draw.line(glow, (255, 90, 60, 70), start, end, width + 14)
             pygame.draw.line(glow, (255, 150, 80, 160), start, end, width + 6)
             pygame.draw.line(glow, (255, 244, 210, 230), start, end, width)
-            screen.blit(glow, (0, 0))
-            pygame.draw.circle(screen, (255, 230, 190), (int(start[0]), int(start[1])), 16)
+            world.blit(glow, (0, 0))
+            pygame.draw.circle(world, (255, 230, 190), (int(start[0]), int(start[1])), 16)
 
         # бойцы
         for soldier in sorted(self.soldiers, key=lambda s: s.y):
-            soldier.draw(screen, sprites, self)
+            soldier.draw(world, sprites, self)
 
-        # копья
+        # копья и плевки
         for spear in self.spears:
-            spear.draw(screen)
+            spear.draw(world)
+        for spit in self.spits:
+            spit.draw(world)
 
         # частицы
         for particle in self.particles:
@@ -1073,7 +1349,11 @@ class Battle:
             radius = max(1, int(particle.radius))
             dot = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
             pygame.draw.circle(dot, (*particle.color, int(220 * alpha)), (radius, radius), radius)
-            screen.blit(dot, (int(particle.x - radius), int(particle.y - radius)))
+            world.blit(dot, (int(particle.x - radius), int(particle.y - radius)))
+
+        if world is not screen:
+            screen.fill((0, 0, 0))
+            screen.blit(world, (ox, oy))
 
         # тексты
         for text in self.texts:
@@ -1090,18 +1370,24 @@ class Battle:
             screen.blit(image, (px, py))
 
         # полоса здоровья босса
-        bar = pygame.Rect(WIDTH // 2 - 240, 16, 480, 50)
+        bar = pygame.Rect(WIDTH // 2 - 240, 16, 480, 58)
         draw_panel(screen, bar, alpha=170)
         label = fonts.small.render("ОГРОМНЫЙ ПАРЕНЬ В ЗЕЛЁНОЙ ФУТБОЛКЕ", True, GOLD)
         screen.blit(label, (bar.x + 12, bar.y + 5))
         chance = fonts.small.render(f"шанс победы {self.win_chance * 100:.0f}%",
                                     True, (230, 220, 200))
         screen.blit(chance, (bar.right - 12 - chance.get_width(), bar.y + 5))
+        hp_text = fonts.small.render(f"HP {self.boss.hp / self.boss.max_hp * 100:.0f}%",
+                                     True, (245, 240, 230))
+        screen.blit(hp_text, (bar.right - 12 - hp_text.get_width(), bar.y + 22))
+        alive = sum(1 for s in self.soldiers if s.alive)
+        losses = percent(ARMY_TARGET - alive, ARMY_TARGET)
+        loss_text = fonts.small.render(f"потери {losses} · живых {alive}/{ARMY_TARGET}",
+                                       True, (226, 176, 168))
+        screen.blit(loss_text, (bar.x + 12, bar.y + 22))
         hp_w = int((bar.w - 24) * (self.boss.hp / self.boss.max_hp))
-        pygame.draw.rect(screen, (48, 30, 32), (bar.x + 12, bar.y + 31, bar.w - 24, 9), border_radius=4)
-        pygame.draw.rect(screen, (196, 66, 58), (bar.x + 12, bar.y + 31, hp_w, 9), border_radius=4)
-        hp_text = fonts.small.render(f"{self.boss.hp / self.boss.max_hp * 100:.0f}%", True, (245, 240, 230))
-        screen.blit(hp_text, (bar.right - 12 - hp_text.get_width(), bar.y + 26))
+        pygame.draw.rect(screen, (48, 30, 32), (bar.x + 12, bar.y + 42, bar.w - 24, 8), border_radius=4)
+        pygame.draw.rect(screen, (196, 66, 58), (bar.x + 12, bar.y + 42, hp_w, 8), border_radius=4)
 
         # итог
         if self.result is not None:
@@ -1155,6 +1441,7 @@ class Simulation:
 
         self.spawn_timer = 1.0
         self.spawn_interval = 2.0
+        self.sneeze_timer = 2.5
         self.speed = 1.0
         self.paused = False
 
@@ -1164,11 +1451,14 @@ class Simulation:
     # ---------- рождение ----------
     def make_child(self) -> Child:
         parents = self.pool + self.spartan_genomes
+        father = mother = None
         if len(parents) >= 2 and random.random() < 0.85:
             weights = [max(0.05, g.fitness()) ** 2 for g in parents]
             father, mother = random.choices(parents, weights=weights, k=2)
+            father_stats = father.effective_stats()
+            mother_stats = mother.effective_stats()
             stats = {
-                key: clamp((father.stats[key] + mother.stats[key]) * 0.5 + random.gauss(0, 0.03))
+                key: clamp((father_stats[key] + mother_stats[key]) * 0.5 + random.gauss(0, 0.03))
                 for key in STAT_KEYS
             }
             generation = max(father.generation, mother.generation) + 1
@@ -1183,9 +1473,28 @@ class Simulation:
             stats[mutation.stat] = clamp(stats[mutation.stat] + mutation.delta)
 
         genome = Genome(stats=stats, generation=generation)
+        self.apply_disease(genome, father, mother)
+
         self.generation = max(self.generation, generation)
         self.born += 1
         return Child(genome, mutations, origin)
+
+    @staticmethod
+    def apply_disease(genome: Genome, father=None, mother=None):
+        """Ребёнок может унаследовать болезнь родителей или подхватить новую."""
+        sick_parent = next(
+            (p for p in (father, mother) if p is not None and p.is_sick()), None
+        )
+        if sick_parent is not None and random.random() < 0.40:
+            genome.disease = sick_parent.disease
+            genome.disease_mult = dict(sick_parent.disease_mult)
+            genome.disease_left = sick_parent.disease_left * random.uniform(0.7, 1.2)
+            return
+        if random.random() < 0.20:
+            disease = random.choices(DISEASES, weights=[d.weight for d in DISEASES], k=1)[0]
+            genome.disease = disease.name
+            genome.disease_mult = dict(disease.multipliers)
+            genome.disease_left = disease.duration
 
     @staticmethod
     def roll_mutations():
@@ -1241,7 +1550,7 @@ class Simulation:
                 del self.pool[100:]
 
         elif kind == "enlisted":
-            self.army.append(Soldier(child.slot, child.look, child.genome.stats))
+            self.army.append(Soldier(child.slot, child.look, genome=child.genome))
             if len(self.army) >= ARMY_TARGET:
                 self.start_march()
 
@@ -1272,7 +1581,7 @@ class Simulation:
 
         elif kind == "joined":
             index = len(self.spartans)
-            x = 236 + (index % 7) * 37
+            x = 352 + (index % 7) * 36
             self.spartans.append(Spartan(x))
             self.spartan_genomes.append(child.genome)
             if len(self.spartan_genomes) > 40:
@@ -1343,8 +1652,22 @@ class Simulation:
         else:
             self._advance(dt)
 
+    def tick_diseases(self, dt: float):
+        for genome in self.pool:
+            genome.tick(dt)
+        for genome in self.spartan_genomes:
+            genome.tick(dt)
+        for soldier in self.army:
+            if soldier.genome is not None:
+                soldier.genome.tick(dt)
+        if self.pending_army:
+            for soldier in self.pending_army:
+                if soldier.genome is not None:
+                    soldier.genome.tick(dt)
+
     def _advance(self, dt: float):
         self.time += dt
+        self.tick_diseases(dt)
 
         if self.battle is not None:
             self.battle.update(dt)
@@ -1383,6 +1706,15 @@ class Simulation:
 
         self.flash = max(0.0, self.flash - dt * 2.4)
 
+        self.sneeze_timer -= dt
+        if self.sneeze_timer <= 0:
+            self.sneeze_timer = random.uniform(2.0, 3.8)
+            sick = [c for c in self.children if c.genome.is_sick()]
+            if sick:
+                victim = random.choice(sick)
+                self.texts.append(FloatingText("апчхи!", victim.x, victim.y - 124,
+                                               (150, 214, 150), life=1.0, font_key="tiny"))
+
         if self.pending_army is not None:
             self.battle_delay -= dt
             if self.battle_delay <= 0:
@@ -1408,6 +1740,8 @@ class Simulation:
             pygame.draw.polygon(screen, (206, 210, 216),
                                 [(x + 12, y - 51), (x + 9, y - 44), (x + 14, y - 44)])
             screen.blit(sprite, (x - sprite.get_width() // 2, y - sprite.get_height()))
+            if soldier.genome is not None and soldier.genome.is_sick():
+                draw_sick_mark(screen, x, y - sprite.get_height() - 7, 0.85)
 
     def draw(self, screen, sprites, fonts):
         if self.battle is not None:
@@ -1512,19 +1846,22 @@ class Simulation:
             screen.blit(pause, (WIDTH // 2 - pause.get_width() // 2, HEIGHT // 2 - pause.get_height() // 2))
 
     def draw_badges(self, screen, child: Child, fonts):
-        if not child.mutations or child.state in ("fall", "saved", "dying", "gone"):
+        if child.state in ("fall", "saved", "dying", "gone"):
             return
         x = child.x - 16
-        if child.positive_count:
-            image = fonts.small.render(f"+{child.positive_count}", True, GOLD)
-            screen.blit(image, (x, child.y - 106))
-            x += image.get_width() + 6
-        if child.negative_count:
-            image = fonts.small.render(f"-{child.negative_count}", True, RED)
-            screen.blit(image, (x, child.y - 106))
+        if child.mutations:
+            if child.positive_count:
+                image = fonts.small.render(f"+{child.positive_count}", True, GOLD)
+                screen.blit(image, (x, child.y - 106))
+                x += image.get_width() + 6
+            if child.negative_count:
+                image = fonts.small.render(f"-{child.negative_count}", True, RED)
+                screen.blit(image, (x, child.y - 106))
+        if child.genome.is_sick():
+            draw_sick_mark(screen, int(child.x), int(child.y - (124 if child.mutations else 108)))
 
     def draw_hud(self, screen, fonts):
-        panel = pygame.Rect(16, 14, 318, 358)
+        panel = pygame.Rect(16, 14, 318, 392)
         draw_panel(screen, panel)
 
         x = panel.x + 14
@@ -1543,6 +1880,13 @@ class Simulation:
             army_now = len(self.army)
             chance = "—"
 
+        sick = sum(1 for g in self.pool if g.is_sick())
+        sick += sum(1 for s in self.army if s.genome is not None and s.genome.is_sick())
+        sick += sum(1 for c in self.children if c.genome.is_sick())
+        pop = len(self.pool) + len(self.army) + len(self.children)
+        if self.battle is not None:
+            sick += sum(1 for s in self.battle.soldiers if s.genome is not None and s.genome.is_sick())
+            pop += len(self.battle.soldiers)
         rows = (
             ("Поколение", str(self.generation)),
             ("Рождено детей", str(self.born)),
@@ -1551,6 +1895,7 @@ class Simulation:
             ("Казнено на месте", f"{self.executed} · {percent(self.executed, self.born)}"),
             ("Выжило (1%)", f"{self.survivors} · {percent(self.survivors, self.culled)}"),
             ("Спартанцев", str(len(self.spartans) + 1)),
+            ("Больны", f"{sick} · {percent(sick, pop)}"),
             ("Армия", f"{army_now}/{ARMY_TARGET} · {percent(army_now, ARMY_TARGET)}"),
             ("Войн", f"{self.wars} · побед {self.victories}"),
             ("Шанс победы", chance),
@@ -1870,6 +2215,15 @@ class Sprites:
         return self._cache[key]
 
 
+def draw_sick_mark(screen, x, y, scale=1.0):
+    """Зелёный крестик над больным ребёнком или бойцом."""
+    size = max(3, int(7 * scale))
+    thick = max(1, int(2 * scale))
+    color = (150, 206, 128)
+    pygame.draw.line(screen, color, (x - size, y), (x + size, y), thick)
+    pygame.draw.line(screen, color, (x, y - size), (x, y + size), thick)
+
+
 def draw_figure(screen, sprite, x, y, bob=0.0, angle=0.0):
     if abs(angle) < 0.5:
         shadow_width = int(sprite.get_width() * 0.8)
@@ -1920,13 +2274,13 @@ def build_background():
 
     # каменистый холм, на котором встают спасённые спартанцы
     pygame.draw.polygon(surface, (138, 110, 80),
-                        [(150, GROUND_Y), (200, PLATEAU_Y), (474, PLATEAU_Y), (524, GROUND_Y)])
-    pygame.draw.line(surface, (172, 140, 98), (200, PLATEAU_Y), (474, PLATEAU_Y), 3)
+                        [(300, GROUND_Y), (350, PLATEAU_Y), (606, PLATEAU_Y), (656, GROUND_Y)])
+    pygame.draw.line(surface, (172, 140, 98), (350, PLATEAU_Y), (606, PLATEAU_Y), 3)
     for _ in range(10):
-        bx = rng.randrange(206, 466)
+        bx = rng.randrange(356, 600)
         by = rng.randrange(PLATEAU_Y - 2, PLATEAU_Y + 12)
         pygame.draw.circle(surface, (108, 86, 66), (bx, by), rng.choice((2, 3)))
-    for gx in range(212, 468, 28):
+    for gx in range(362, 600, 28):
         pygame.draw.line(surface, (120, 140, 84), (gx, PLATEAU_Y + 7), (gx + 3, PLATEAU_Y - 5), 2)
 
     # палатки
